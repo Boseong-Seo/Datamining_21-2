@@ -1,0 +1,1199 @@
+---
+title: "modeling"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+library(tidyverse)
+library(xgboost)  # for xgboost
+library(nnet)     # for multinomial logistic
+library(mlr)
+library(fastDummies) # to convert dummy variables
+library(e1071)    # for svm
+library(caret)    # for split data & train data
+library(data.table)  # for setDT in xgboost
+```
+
+```{r}
+# load the data
+#vaers <- read.csv('vaers_jan_oct_2021_preprocessed_1204_integrated.csv')
+```
+
+일단 데이터셋에 있는 결측치 등등 먼저 손보자.
+
+어느 변수에 결측치가 존재하는지부터 살펴보자.
+
+```{r}
+# 어느 변수에 결측치가 있니?
+#vaers %>% map_int(~sum(is.na(.)))
+```
+
+ER_VISIT 변수는 전부 다 NA로 되어 있어서 필요없다고 판단.
+
+```{r}
+#vaers <- vaers %>% select(-c("ER_VISIT"))
+```
+
+변수의 type이 character인 것중에 NA가 존재하는 것에는, 결측치를 "-"로 대체하기로 함.
+
+```{r}
+# to handle the na value of ALLERGIES
+#vaers[is.na(vaers$ALLERGIES), ]$ALLERGIES <- "-"
+#vaers[is.na(vaers$HISTORY), ]$HISTORY <- "-"
+#vaers[is.na(vaers$ER_ED_VISIT),]$ER_ED_VISIT <- "-"
+#vaers[is.na(vaers$OFC_VISIT),]$OFC_VISIT <- "-"
+#vaers[is.na(vaers$OTHER_MEDS),]$OTHER_MEDS <- "-"
+#vaers[is.na(vaers$VAX_LOT),]$VAX_LOT <- "-"
+#vaers[is.na(vaers$VAX_DOSE_SERIES),]$VAX_DOSE_SERIES <- "-"
+#vaers[is.na(vaers$VAX_ROUTE),]$VAX_ROUTE <- "-"
+#vaers[is.na(vaers$VAX_SITE),]$VAX_SITE <- "-"
+```
+
+다음으로 day와 관련해서, numdays와 hospdays와 datedied가 NA인 사람들은 그냥 0으로 채웠음.
+뭐 .. 어떻게 생각해보면 결측치라는 게, 입원했지 않고, 사망은 안 했으니까 없는 거 아니겠어?
+그러니까 0으로 채워도 무방하다고 판단했음.
+
+* 그런데 numdays에 결측치가 있는 건 어떻게 해야할지 모르겠네 ...?
+(numdays에 결측치가 존재하는 게 그렇게 많지 않다면, 그냥 numdays에 결측치가 존재하는 것은 제거하고서 분석 진행해도 괜찮을 것 같음.)
+
+```{r}
+#vaers[is.na(vaers$NUMDAYS),]$NUMDAYS <- 0
+#vaers[is.na(vaers$HOSPDAYS), ]$HOSPDAYS <- 0
+#vaers[is.na(vaers$DATEDIED), ]$DATEDIED <- 0 
+```
+
+마지막으로 이 X 변수가 왜 있는 건지 모르겠다 ..? 제거해주자
+
+```{r}
+#vaers <- vaers %>% select(-c("X"))
+```
+
+그러고서 나중에 또 이 작업 거치기 귀찮으니까 ..
+전처리해둔 거 저장해두자.
+
+```{r}
+#write.csv(vaers, 'preprocess_for_modeling.csv', row.names=FALSE)
+```
+
+
+```{r load_data}
+vaers <- read.csv('preprocess_for_modeling.csv')
+```
+
+
+
+### SVM -------------------------------------------------------
+
+SVM을 돌릴 때 모든 데이터셋과 모든 변수를 사용하면 메모리가 부족하여 종종 세션이 다운되는 이슈가 발생하였다. 그래서 그의 대안으로 전체 데이터셋 중 일부만을 샘플링해서 사용하기로 결정하였다. 그래도 최대한 많은 데이터셋을 사용하기 위해, 여러 시도 끝에 로컬이 감당할 수 있는 선이 1~20%임을 찾아내어, 전체 데이터셋중 20%만 랜덤 추출하여 이 데이터셋을 가지고서 SVM을 시도하였다. 
+
+※ 물론, 샘플링이 아래의 결과에 영향을 어느 정도 끼치므로 완전히 신뢰할 수는 없겠으나, 아래의 일련의 과정을 거치면 백신 부작용에 영향을 끼치는 변수를 알 수 있음을 증명해보였다는 것으로도 의미가 있다고 생각된다.
+※ 분석 결과의 신뢰성을 위해서는 샘플링을 통해 ADVERSE에 유의한 영향을 끼친다고 생각되는 predictor를 뽑는 과정을 여러 번 시도했어야 할 테지만, 컴퓨터의 성능상, 그리고 시간상(한 번 돌릴 때 12시간 넘게 걸림) 이 과정을 더는 반복하지는 않았다. 
+
+우선, 샘플링한 데이터셋을 전체 데이터로 보고서, 0.4:0.4:0.2의 비율로 training:validation:test set으로 분리하였다. 이때 각 dataset에서 ADVERSE의 class 비율이 유지되도록 하기 위해 `caret` 패키지의 `createDataPartition()` 함수를 이용하였다.  
+
+```{r}
+# data frame for svm
+set.seed(1)
+svmIdx <- createDataPartition(vaers$ADVERSE, p=0.1, list=FALSE)
+df_svm <- vaers[svmIdx, ]
+df_svm$ADVERSE <- df_svm$ADVERSE %>% as.factor() %>%
+  fct_relevel("OTHER", "PAIN", "HOSPITAL", "DISORDER", "DIED")
+
+# vax_dose_series에서 UNK(unknown)로 되어 있는 것을 "-"로 바꿔주자
+df_svm[df_svm$VAX_DOSE_SERIES == "UNK", 3] <- "-"
+df_svm$VAX_DOSE_SERIES <- df_svm$VAX_DOSE_SERIES %>% as.factor() %>%
+  fct_relevel("-", "1", "2", "3", "4", "5", "6", "7+")
+
+df_svm[df_svm$OFC_VISIT == "-", "OFC_VISIT"] <- "N"
+df_svm[df_svm$OFC_VISIT == "N", "OFC_VISIT"] <- 0
+df_svm[df_svm$OFC_VISIT == "Y", "OFC_VISIT"] <- 1
+df_svm$OFC_VISIT <- df_svm$OFC_VISIT %>% as.integer()
+
+df_svm[df_svm$ER_ED_VISIT == "-", "ER_ED_VISIT"] <- "N"
+df_svm[df_svm$ER_ED_VISIT == "N", "ER_ED_VISIT"] <- 0
+df_svm[df_svm$ER_ED_VISIT == "Y", "ER_ED_VISIT"] <- 1
+df_svm$ER_ED_VISIT <- df_svm$ER_ED_VISIT %>% as.integer()
+
+df_svm$RECOVD <- df_svm$RECOVD %>% as.factor() %>%
+  fct_relevel("U", "N", "Y")
+
+df_svm$AGE_GROUP <- df_svm$AGE_GROUP %>% as.factor() %>%
+  fct_relevel("40-", "40~59", "60+")
+
+df_svm$VAX_ROUTE <- df_svm$VAX_ROUTE %>% as.factor()
+df_svm$VAX_SITE <- df_svm$VAX_SITE %>% as.factor()
+df_svm$VAX_NAME <- df_svm$VAX_NAME %>% as.factor()
+df_svm$SEX <- df_svm$SEX %>% as.factor()
+df_svm$V_ADMINBY <- df_svm$V_ADMINBY %>% as.factor()
+
+# OTHER_MEDS도 받고 있는지 여부로 바꿨음
+df_svm[df_svm$OTHER_MEDS != "None", "OTHER_MEDS"] <- 1
+df_svm[df_svm$OTHER_MEDS == "None", "OTHER_MEDS"] <- 0
+df_svm$OTHER_MEDS <- df_svm$OTHER_MEDS %>% as.integer()
+```
+
+△ SVM을 돌리기 위한 적절한 형태로 데이터셋을 가공
+
+```{r}
+# split the data into training and test set
+set.seed(3)
+testIdx <- createDataPartition(df_svm$ADVERSE, p=0.2, list=FALSE)
+train_svm <- df_svm[-testIdx, ]
+test_svm <- df_svm[testIdx, ]
+
+# split the validation set into training and validation set
+set.seed(5)
+valIdx <- createDataPartition(train_svm$ADVERSE, p=0.5, list=FALSE)
+val_svm <- train_svm[valIdx, ]
+train_svm <- train_svm[-valIdx, ]
+```
+
+뿐만 아니라 모든 predictor를 다 사용해서 SVM을 돌렸을 때, 용량 부족 이슈가 발생하는 것을 발견하였다. 다행히도, 여러 시도 끝에 8개의 predictor까지는 로컬상에서 큰 문제없이 돌아가는 것을 확인할 수 있었다. 따라서 response로 설정해둔 ADVERSE를 잘 설명하는 8개의 predictor만을 택하여 모델을 돌리기로 했다.  
+
+이때 110개의 predictor 중에서, RF 시 문제가 발견됐던 HISTORY와 CUR_ILL의 파생변수들과 ADVERSE를 생성하는 데 사용됐던 PAIN, DISORDER, HOSPITAL, DIED 변수 등을 제하고, 남은 21개의 feature*에 대해서만 ADVERSE를 얼마나 잘 설명하는지 확인하고자 했다.
+
+* 여기서의 21개 feature는 다음과 같다:
+VAX_LOT, VAX_DOSE_SERIES, V_ADMINBY, ER_ED_VISIT, SEX, AGE_GROUP, AGE_YRS, DISABLE, L_THREAT, CVD, Mental, Lifestyle, HOSPDAYS, PRIOR_VAX, VAX_NAME, ..
+
+여기서, ADVERSE가 multi class인 점을 고려하여 각 feature를 predictor로 놓고서 multinomial logistic 모델을 적합하였다. 
+
+```{r}
+# date 라던지 이미 파생 feature가 있는 경우 원 feature를 삭제했음
+X <- train_svm %>% select(-c(VAERS_ID, RECVDATE, DATEDIED, VAX_DATE, VAX_LOT,
+                             ONSET_DATE, CUR_ILL, HISTORY, FORM_VERS,
+                             29:53, 55:79, 83:107, ADVERSE, ALLERGIES,
+                             # 알러지 여부도 LifeStyle 열에 포함되어 있어서 삭제
+                             # y 변수가 아래 4개에서 비롯됐으니까 삭제
+                             PAIN, DISORDER, HOSPITAL, DIED))
+# empty vector in order to gather deviance from each logistic model
+dev_lst <- vector("double", length = ncol(X))
+```
+
+`nnet` 패키지의 `multinom()` 함수를 사용하기 위해서는 reference level을 반드시 define해주어야 하므로, 함수를 fitting하기 전에 우선 ADVERSE 변수의 OTHER level을 reference level로 설정해주었다.  
+  
+```{r}
+# multinomial logistic fitting
+train_svm$ADVERSE <- train_svm$ADVERSE %>% relevel(ref='OTHER')
+formula_lst <- str_c("ADVERSE ~ ", colnames(X))
+for(i in 1:ncol(X)){
+  multi_logit <- multinom(formula_lst[i], data=train_svm)
+  dev_lst[i] <- multi_logit$deviance
+}
+```
+
+위의 multinomial logistic fitting 결과를 정리해보자면 다음과 같다.  
+
+```{r}
+col <- colnames(X)
+(data.frame(feature = col, dev = dev_lst) %>%
+    arrange(dev))
+```
+
+※ 현재 predictor로 AGE와 관련된 것이 AGE_YRS와 AGE_GROUP 이 두 가지가 있다. 이 둘 간에는 multicollinearity가 존재하므로, 만약 두 변수 모두 deviance가 작게 나온다면 둘 중에서 더 낮은 deviance를 가지는 것만 택하고자 한다. 
+
+HOSPDAYS -> L_THREAT -> ER_ED_VISIT -> AGE_YRS -> VAX_SITE -> RECOVD -> SEX -> Lifestyle
+이렇게 8개의 변수가 ADVERSE 변수를 잘 설명하는 것으로 나타났다.
+다만, 위의 결과가 전체 데이터셋 중 극 일부만 사용하여 bias가 존재할 수도 있다는 점에서, Random forest에서의 변수 중요도 결과도 참고하고자 했다. 
+
+Random Forest에서는 DISABLE -> AGE_GROUP -> SEX -> Lifestyle -> CVD -> VAX_NAME -> PRIOR_VAX -> Mental 순으로 ADVERSE에 많은 영향을 끼치는 것으로 나타났으며, 위의 multinomial logistic regression에서는 HOSPDAYS와 VAX_LOT만 유독 deviance가 작고 그 외의 다른 변수들은 비슷한 deviance 값을 가지고 있어, 최종적으로는 아래의 8개 변수를 택하고자 하였다.
+이때 RF에서의 변수 중요도뿐만 아니라, 일반적인 상식 하에서 백신 부작용에 영향을 끼칠 것으로 생각되는데 포함되지 않은 변수까지도 종합적으로 고려하고자 했다.  
+
+최종적으로 SVM 모델링에서 사용하기로 결정된 8개의 feature들
+==> HOSPDAYS, DISABLE, AGE_YRS, SEX, Lifestyle, CVD, L_THREAT, ER_ED_VISIT
+
+이제 위 결과를 토대로 SVM을 돌려보자.
+
+```{r}
+# 지금 모델에 factor들이 많아서 train_svm 자체를 이용하기보다는
+# model.matrix를 이용해서 data를 만드는 게 좀 더 정확한 결과를 제시
+X_tmp <- train_svm %>%
+  select(ADVERSE, DISABLE, HOSPDAYS, ER_ED_VISIT, SEX,
+         L_THREAT, AGE_YRS, Lifestyle, CVD) %>%
+  dummy_cols(select_columns = c("SEX"),
+             remove_selected_columns = TRUE)
+
+# scale을 우선 먼저 해주자 : HOSPDAYS, AGE_YRS
+X_tmp$AGE_YRS <- X_tmp$AGE_YRS %>% scale()
+X_tmp$HOSPDAYS <- X_tmp$HOSPDAYS %>% scale()
+
+mf <- model.frame(ADVERSE~.-1, X_tmp)
+mt <- terms(mf)
+X_final <- model.matrix(mt, mf)
+y_final <- model.response(mf)
+```
+
+우선, hyperparameter를 모두 default 값(cost=1)으로 둔 채 SVM을 돌려보았다.
+이때 bootstrapping 횟수만 500으로 조정.
+
+```{r}
+# fit the svm model - baseline function
+svmfit <- svm(X_final, y_final, B = 500)
+```
+
+baseline model의 성능 확인
+
+```{r}
+# predict
+val_svm <- val_svm %>%
+  select(ADVERSE, DISABLE, HOSPDAYS, ER_ED_VISIT, SEX,
+         L_THREAT, AGE_YRS, Lifestyle, CVD) %>%
+  dummy_cols(select_columns=c("SEX"),
+             remove_selected_columns = TRUE)
+
+# scale을 우선 먼저 해주자 : HOSPDAYS, AGE_YRS
+val_svm$AGE_YRS <- val_svm$AGE_YRS %>% scale()
+val_svm$HOSPDAYS <- val_svm$HOSPDAYS %>% scale()
+
+mf <- model.frame(ADVERSE~.-1, val_svm)
+mt <- terms(mf)
+X_val_final <- model.matrix(mt, mf)
+
+svm_preds <- predict(svmfit, newdata=X_val_final)
+```
+
+
+```{r}
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = val_svm$ADVERSE)
+```
+
+다음으로, cost hyperparameter를 tuning함으로써 SVM 모델의 성능을 향상시켜보자
+
+```{r}
+# tune the cost parameter
+# svm의 default cost는 1임
+cost_lst = c(0.01, 0.1, 1, 10, 50)
+best_cost <- NULL
+error_rate = 1
+
+for(i in seq_along(cost_lst)){
+  set.seed(1)
+  svm.tune <- svm(X_final, y_final, B=500, cost=cost_lst[i])
+  svm_preds <- predict(svm.tune, newdata = X_val_final)
+  new_err_rate <- mean(svm_preds != val_svm$ADVERSE)
+  if(new_err_rate < error_rate){
+    error_rate = new_err_rate
+    best_cost = cost_lst[i]
+  }
+}
+```
+
+위에서 구한 best cost 값으로 최종적으로 모델을 다시 fitting해주자.
+이때는 training set과 validation set 모두 이용해서 fitting해야 한다는 점에 유의.
+
+```{r}
+X_tmp <- df_svm[-testIdx, ] %>%
+  select(ADVERSE, DISABLE, HOSPDAYS, ER_ED_VISIT, SEX,
+         L_THREAT, AGE_YRS, Lifestyle, CVD) %>%
+  dummy_cols(select_columns=c("SEX"),
+             remove_selected_columns = TRUE)
+
+X_tmp$AGE_YRS <- X_tmp$AGE_YRS %>% scale()
+X_tmp$HOSPDAYS <- X_tmp$HOSPDAYS %>% scale()
+
+mf <- model.frame(ADVERSE~.-1, X_tmp)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+svm_final <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+summary(svm_final)
+```
+
+이제 최종 모델의 성능을 예측해보자.
+
+```{r}
+# data set for prediction
+test_svm <- test_svm %>%
+  select(ADVERSE, DISABLE, HOSPDAYS, ER_ED_VISIT, SEX,
+         L_THREAT, AGE_YRS, Lifestyle, CVD) %>%
+  dummy_cols(select_columns = c("SEX"),
+             remove_selected_columns=TRUE)
+
+test_svm$AGE_YRS <- test_svm$AGE_YRS %>% scale()
+test_svm$HOSPDAYS <- test_svm$HOSPDAYS %>% scale()
+
+mf <- model.frame(ADVERSE~.-1, test_svm)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(svm_final, newdata = X_test)
+```
+
+```{r}
+# confusion matrix for test data
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+
+
+
+# ADVERSE class 이분류 -----
+
+이제 방향을 다르게 해서, OTHER+PAIN / HOSPITAL+DISORDER+DIED로 class를 이분류해서 새롭게 fitting 해보고자 한다.
+-> SYMPTOM을 분류할 때, 우리가 미처 분류해내지 못한 OTHER에 속한 것들이 HOSPITAL, DISORDER, DIED만큼 심각한 질병은 아니었음을 확인했다. 따라서 위와 같이 binary class로 분류해도 무방하다고 판단했다.
+
+```{r}
+# response to binary class
+df_svm$ADVERSE <- df_svm$ADVERSE %>% as.character()
+
+df_svm[df_svm$ADVERSE %in% c("OTHER", "PAIN"), "ADVERSE"] <- 0
+df_svm[df_svm$ADVERSE %in% c("HOSPITAL", "DISORDER", "DIED"), "ADVERSE"] <- 1
+df_svm$ADVERSE <- df_svm$ADVERSE %>% as.integer()
+```
+
+
+```{r}
+# split the data into training and test set
+set.seed(3)
+testIdx <- createDataPartition(df_svm$ADVERSE, p=0.2, list=FALSE)
+train_svm <- df_svm[-testIdx, ]
+test_svm <- df_svm[testIdx, ]
+
+# split the validation set into training and validation set
+set.seed(5)
+valIdx <- createDataPartition(train_svm$ADVERSE, p=0.5, list=FALSE)
+val_svm <- train_svm[valIdx, ]
+train_svm <- train_svm[-valIdx, ]
+```
+
+ADVERSE 변수를 multi-class에서 binary-class로 변환함으로써, ADVERSE를 잘 설명하는 predictor가 사뭇 달라졌을 수도 있다. 따라서 이번에도 ADVERSE를 잘 설명하는 8개의 변수를 우선 찾고자 하였다. 다만, 이제는 ADVERSE가 binary class이므로 multinomial logistic이 아닌 simple logistic regression을 적합하였다.
+
+```{r}
+# multinomial logistic fitting
+formula_lst <- str_c("ADVERSE ~ ", colnames(X))
+for(i in 1:ncol(X)){
+  logit <- glm(formula_lst[i], data=train_svm, family="binomial")
+  dev_lst[i] <- logit$deviance
+}
+```
+
+위의 logistic fitting 결과를 정리해보자면 다음과 같다.  
+
+```{r}
+col <- colnames(X)
+(data.frame(feature = col, dev = dev_lst) %>%
+    arrange(dev))
+```
+
+DISABLE이 10위로 약간 상승한 것 외에는 전체적으로 (2)에서 진행했던 결과와 비슷하다. 따라서 이번에도 최종 SVM 모델에서 사용할 8개의 변수로, HOSPDAYS, DISABLE, AGE_YRS, SEX, Lifestyle, CVD, L_THREAT, ER_ED_VISIT,를 사용하고자.
+
+```{r}
+# 지금 모델에 factor들이 많아서 train_svm 자체를 이용하기보다는
+# model.matrix를 이용해서 data를 만드는 게 좀 더 정확한 결과를 제시
+X_tmp <- train_svm %>%
+  select(ADVERSE, DISABLE, HOSPDAYS, ER_ED_VISIT, SEX,
+         L_THREAT, AGE_YRS, Lifestyle, CVD) %>%
+  dummy_cols(select_columns = c("SEX"),
+             remove_selected_columns = TRUE)
+
+# scale을 우선 먼저 해주자 : HOSPDAYS, AGE_YRS
+X_tmp$AGE_YRS <- X_tmp$AGE_YRS %>% scale()
+X_tmp$HOSPDAYS <- X_tmp$HOSPDAYS %>% scale()
+X_tmp$ADVERSE <- as.factor(X_tmp$ADVERSE)
+
+mf <- model.frame(ADVERSE~.-1, X_tmp)
+mt <- terms(mf)
+X_final <- model.matrix(mt, mf)
+y_final <- model.response(mf)
+```
+
+우선, hyperparameter를 모두 default 값(cost=1)으로 둔 채 SVM을 돌려보았다.
+마찬가지로 bootstrap 횟수는 500으로 두었음.
+
+```{r}
+# fit the svm model - baseline function
+bin_svmfit <- svm(X_final, y_final, B = 500)
+summary(bin_svmfit)
+```
+
+baseline model의 성능 확인
+
+```{r}
+# predict
+val_svm <- val_svm %>%
+  select(ADVERSE, DISABLE, HOSPDAYS, ER_ED_VISIT, SEX,
+         L_THREAT, AGE_YRS, Lifestyle, CVD) %>%
+  dummy_cols(select_columns=c("SEX"),
+             remove_selected_columns = TRUE)
+
+# scale을 우선 먼저 해주자 : HOSPDAYS, AGE_YRS
+val_svm$AGE_YRS <- val_svm$AGE_YRS %>% scale()
+val_svm$HOSPDAYS <- val_svm$HOSPDAYS %>% scale()
+val_svm$ADVERSE <- as.factor(val_svm$ADVERSE)
+
+mf <- model.frame(ADVERSE~.-1, val_svm)
+mt <- terms(mf)
+X_val_final <- model.matrix(mt, mf)
+
+svm_preds <- predict(bin_svmfit, newdata=X_val_final)
+```
+
+
+```{r}
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = as.factor(val_svm$ADVERSE))
+```
+
+다음으로, cost hyperparameter를 tuning함으로써 SVM 모델의 성능을 향상시켜보자
+
+```{r}
+# tune the cost parameter
+# svm의 default cost는 1임
+cost_lst = c(0.01, 0.1, 1, 10, 50)
+best_cost <- NULL
+error_rate = 1
+
+for(i in seq_along(cost_lst)){
+  set.seed(1)
+  bin_svm.tune <- svm(X_final, y_final, B=500, cost=cost_lst[i])
+  svm_preds <- predict(bin_svm.tune, newdata = X_val_final)
+  new_err_rate <- mean(svm_preds != val_svm$ADVERSE)
+  if(new_err_rate < error_rate){
+    error_rate = new_err_rate
+    best_cost = cost_lst[i]
+  }
+}
+```
+
+위에서 구한 best cost 값으로 최종적으로 모델을 다시 fitting해주자.
+이때는 training set과 validation set 모두 이용해서 fitting해야 한다는 점에 유의.
+
+```{r}
+X_tmp <- df_svm[-testIdx, ] %>%
+  select(ADVERSE, DISABLE, HOSPDAYS, ER_ED_VISIT, SEX,
+         L_THREAT, AGE_YRS, Lifestyle, CVD) %>%
+  dummy_cols(select_columns=c("SEX"),
+             remove_selected_columns = TRUE)
+
+X_tmp$AGE_YRS <- X_tmp$AGE_YRS %>% scale()
+X_tmp$HOSPDAYS <- X_tmp$HOSPDAYS %>% scale()
+X_tmp$ADVERSE <- as.factor(X_tmp$ADVERSE)
+
+mf <- model.frame(ADVERSE~.-1, X_tmp)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+summary(bin_svm_final)
+```
+
+이제 최종 모델의 성능을 예측해보자.
+
+```{r}
+# data set for prediction
+test_svm <- test_svm %>%
+  select(ADVERSE, DISABLE, HOSPDAYS, ER_ED_VISIT, SEX,
+         L_THREAT, AGE_YRS, Lifestyle, CVD) %>%
+  dummy_cols(select_columns = c("SEX"),
+             remove_selected_columns=TRUE)
+
+test_svm$AGE_YRS <- test_svm$AGE_YRS %>% scale()
+test_svm$HOSPDAYS <- test_svm$HOSPDAYS %>% scale()
+test_svm$ADVERSE <- test_svm$ADVERSE %>% as.factor()
+
+mf <- model.frame(ADVERSE~.-1, test_svm)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final, newdata = X_test)
+```
+
+
+```{r}
+# confusion matrix for test data
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+마지막으로 최종 binary SVM classifier을 바탕으로 변수 중요도를 구해보자.
+이때 SVM에서의 변수 중요도를 direct하게 구할 수 있는 방법은 존재하지 않음.
+따라서 각 변수를 제한 7개를 가지고서 fit했을 때의 BA와 전체 다 넣었을 때의 BA값과 비교하는 방식으로 해당 변수의 중요도를 구해야 할 듯.
+
+(1) hospdays 변수 중요도
+
+```{r svm_feature_importance_1}
+## (1) HOSPDAYS
+X_tmp1 <- X_tmp %>% select(-HOSPDAYS)
+mf <- model.frame(ADVERSE~.-1, X_tmp1)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final_without_hosp <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+
+# data set for prediction
+test_svm1 <- test_svm %>% select(-HOSPDAYS)
+
+mf <- model.frame(ADVERSE~.-1, test_svm1)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final_without_hosp, newdata = X_test)
+
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+HOSPDAYS 변수를 제거하니, BA가 0.1722 가량 감소. 이 정도가 HOSPDAYS가 response에 미치는 영향이라고 볼 수 있을 것.
+
+(2) DISABLE 변수 중요도
+
+```{r}
+## (2) DISABLE
+X_tmp2 <- X_tmp %>% select(-DISABLE)
+mf <- model.frame(ADVERSE~.-1, X_tmp2)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final_without_disable <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+
+# data set for prediction
+test_svm2 <- test_svm %>% select(-DISABLE)
+
+mf <- model.frame(ADVERSE~.-1, test_svm2)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final_without_disable, newdata = X_test)
+
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+(3) age_yrs의 변수 중요도
+
+```{r}
+## (3) AGE_YRS
+X_tmp3 <- X_tmp %>% select(-AGE_YRS)
+mf <- model.frame(ADVERSE~.-1, X_tmp3)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final_without_age <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+
+# data set for prediction
+test_svm3 <- test_svm %>% select(-AGE_YRS)
+
+mf <- model.frame(ADVERSE~.-1, test_svm3)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final_without_age, newdata = X_test)
+
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+(4) sex 변수의 변수 중요도
+
+```{r}
+## (4) SEX
+X_tmp4 <- X_tmp %>% select(-c("SEX_F", "SEX_M", "SEX_U"))
+mf <- model.frame(ADVERSE~.-1, X_tmp4)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final_without_sex <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+
+# data set for prediction
+test_svm4 <- test_svm %>% select(-c("SEX_F", "SEX_M", "SEX_U"))
+
+mf <- model.frame(ADVERSE~.-1, test_svm4)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final_without_sex, newdata = X_test)
+
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+(5) Lifestyle 변수 중요도
+
+```{r}
+## (5) Lifestyle
+X_tmp5 <- X_tmp %>% select(-Lifestyle)
+mf <- model.frame(ADVERSE~.-1, X_tmp5)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final_without_life <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+
+# data set for prediction
+test_svm5 <- test_svm %>% select(-Lifestyle)
+
+mf <- model.frame(ADVERSE~.-1, test_svm5)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final_without_life, newdata = X_test)
+
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+
+```
+
+(6) CVD 변수 중요도
+
+```{r}
+## (6) CVD
+X_tmp6 <- X_tmp %>% select(-CVD)
+mf <- model.frame(ADVERSE~.-1, X_tmp6)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final_without_cvd <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+
+# data set for prediction
+test_svm6 <- test_svm %>% select(-CVD)
+
+mf <- model.frame(ADVERSE~.-1, test_svm6)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final_without_cvd, newdata = X_test)
+
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+(7) L_THREAT 변수 중요도
+
+```{r}
+## (7) L_THREAT
+X_tmp7 <- X_tmp %>% select(-L_THREAT)
+mf <- model.frame(ADVERSE~.-1, X_tmp7)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final_without_lthreat <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+
+# data set for prediction
+test_svm7 <- test_svm %>% select(-L_THREAT)
+
+mf <- model.frame(ADVERSE~.-1, test_svm7)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final_without_lthreat, newdata = X_test)
+
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+(8) ER_ED_VISIT 변수 중요도
+
+```{r}
+## (8) ER_ED_VISIT
+X_tmp8 <- X_tmp %>% select(-ER_ED_VISIT)
+mf <- model.frame(ADVERSE~.-1, X_tmp8)
+mt <- terms(mf)
+X_fit <- model.matrix(mt, mf)
+y_fit <- model.response(mf)
+
+# final svm model with best cost param
+bin_svm_final_without_er <- svm(X_fit, y_fit, B = 500, cost = best_cost)
+
+# data set for prediction
+test_svm8 <- test_svm %>% select(-ER_ED_VISIT)
+
+mf <- model.frame(ADVERSE~.-1, test_svm8)
+mt <- terms(mf)
+X_test <- model.matrix(mt, mf)
+
+# prediction
+svm_preds <- predict(bin_svm_final_without_er, newdata = X_test)
+
+# confusion matrix
+confusionMatrix(data = svm_preds, reference = test_svm$ADVERSE)
+```
+
+
+## xgboost --------------------------------------------
+
+[ 참고 링크 ]
+https://www.hackerearth.com/practice/machine-learning/machine-learning-algorithms/beginners-tutorial-on-xgboost-parameter-tuning-r/tutorial/
+
+xgb에서 xgb.DMatrix type이 제일 recommend된다고 하니, 일단 vaers dataset을 해당 type으로 transform시켜보자.
+svm에서와 마찬가지로 용량 문제가 발생하여, 전체 데이터셋에서 10%만 랜덤하게 추출해 그렇게 추출된 데이터셋을 전체 데이터셋으로 간주하여 모델링을 진행했다.
+
+※ 자꾸 에러가 뜨는데, 아마도 우리의 데이터셋에서 character type인 변수가 존재해서 그런 것 같다. 그래서 factor로 처리했는데도 에러가 뜨네 .?
+검색해보니, xgb.DMatrix 상에서 factor 처리를 해도 또다시 character로 cast(?)되기 때문이라고 한다. 따라서 factor 처리에서 끝내지 말고, 더 나아가 integer type으로 변환시켜줘야 하는 듯.
+
+
+```{r data_for_xgb}
+#set.seed(9)
+#xgbIdx <- createDataPartition(vaers$ADVERSE, p=0.7, list=FALSE)
+df_xgb <- vaers %>%
+  select(-c(VAERS_ID, RECVDATE, DATEDIED, VAX_DATE, VAX_LOT,
+            ONSET_DATE, CUR_ILL, HISTORY, FORM_VERS,
+            29:53, 55:79, 83:107, ALLERGIES, AGE_GROUP,
+            PAIN, DISORDER, HOSPITAL, DIED))
+df_xgb$ADVERSE <- df_xgb$ADVERSE %>% as.factor() %>%
+  fct_relevel("OTHER", "PAIN", "HOSPITAL", "DISORDER", "DIED")
+
+df_xgb[df_xgb$VAX_DOSE_SERIES == "UNK", "VAX_DOSE_SERIES"] <- "-"
+
+df_xgb[df_xgb$OFC_VISIT == "-", "OFC_VISIT"] <- "N"
+df_xgb[df_xgb$OFC_VISIT == "N", "OFC_VISIT"] <- 0
+df_xgb[df_xgb$OFC_VISIT == "Y", "OFC_VISIT"] <- 1
+df_xgb$OFC_VISIT <- df_xgb$OFC_VISIT %>% as.integer()
+
+df_xgb[df_xgb$ER_ED_VISIT == "-", "ER_ED_VISIT"] <- "N"
+df_xgb[df_xgb$ER_ED_VISIT == "N", "ER_ED_VISIT"] <- 0
+df_xgb[df_xgb$ER_ED_VISIT == "Y", "ER_ED_VISIT"] <- 1
+df_xgb$ER_ED_VISIT <- df_xgb$ER_ED_VISIT %>% as.integer()
+
+# OTHER_MEDS도 받고 있는지 여부로 바꿨음
+df_xgb[df_xgb$OTHER_MEDS != "None", "OTHER_MEDS"] <- 1
+df_xgb[df_xgb$OTHER_MEDS == "None", "OTHER_MEDS"] <- 0
+df_xgb$OTHER_MEDS <- df_xgb$OTHER_MEDS %>% as.integer()
+
+df_xgb[df_xgb$RECOVD == "U", "RECOVD"] <- 0
+df_xgb[df_xgb$RECOVD == "Y", "RECOVD"] <- 1
+df_xgb[df_xgb$RECOVD == "N", "RECOVD"] <- 0
+df_xgb$RECOVD <- df_xgb$RECOVD %>% as.integer()
+
+# missing 같은 거는 그냥 다 버릴 거임 ㅋ 짱나게 하네 정말
+# VAX_DOES_SERIES가 "-", "UNK"
+# VAX_NAME UNKNOWN
+# V_ADMINBY UNK
+df_xgb <- df_xgb %>% filter(VAX_DOSE_SERIES != "-") %>%
+  filter(VAX_NAME != "UNKNOWN") %>%
+  filter(V_ADMINBY != "UNK") %>%
+  filter(SEX != "U") %>%
+  filter(VAX_ROUTE != "-") %>%
+  filter(VAX_SITE != "-") %>%
+  filter(VAX_SITE != "UN") %>%
+  filter(VAX_ROUTE != "UN")
+
+# split the data into training and test set
+set.seed(3)
+testIdx <- createDataPartition(df_xgb$ADVERSE, p=0.2, list=FALSE)
+train_xgb <- df_xgb[-testIdx, ]
+test_xgb <- df_xgb[testIdx, ]
+
+# convert data frame to data table
+setDT(train_xgb)
+setDT(test_xgb)
+```
+
+training set만을 우선 xgboost 모델링에 적합한 xgb.DMatrix 형태로 바꿔주었다.
+
+```{r}
+# xgb에서 "multi:softmax" 사용하려면은 0 ~ num_class - 1로 코딩되어야 하는 거 같음.
+# 그런데 factor 에서는 1 ~ num_class로 코딩되니까 1 빼줬음.
+tr_label <- as.numeric(train_xgb$ADVERSE) - 1
+ts_label <- as.numeric(test_xgb$ADVERSE) - 1
+
+new_train_xgb <- model.matrix(~.+0, data=train_xgb[,-c("ADVERSE"), with=FALSE])
+new_test_xgb <- model.matrix(~.+0, data=test_xgb[,-c("ADVERSE"), with=FALSE])
+
+# new_train_xgb랑 new_test_xgb랑 column 맞춰주는 작업
+# new_test_xgb에 없는 column 찾아내기
+#train_cols <- colnames(new_train_xgb)
+#not_in_test <- train_cols[!(train_cols %in% colnames(new_test_xgb))]
+# 그렇게 찾아낸 column 영벡터로 채워넣기
+#new_test_xgb <- cbind(new_test_xgb,
+#                      `VAX_ROUTEPO` = rep(0, dim(new_test_xgb)[1]),
+#                      `VAX_SITEMO` = rep(0, dim(new_test_xgb)[1]))
+# new_train_xgb와 column order도 맞춰야 함
+#new_test_xgb <- new_test_xgb %>% as.data.frame() %>%
+#  select(1:11, 47, 12:18, 48, 19:46) %>%
+#  as.matrix()
+
+# xgb.train에 쓰일 수 있는 적절한 형태의 input type으로 만들어주자.
+tr_dat_xgb <- xgb.DMatrix(data=new_train_xgb, label=tr_label)
+ts_dat_xgb <- xgb.DMatrix(data=new_test_xgb, label=ts_label)
+```
+
+이제 이 training set을 가지고서, hyperparameter값이 전부 default로 설정된 상태에서 xgboost model을 fitting해보자.
+
+이때 본격적인 model training하기에 앞서, CV를 이용해 best nrounds값을 찾기 위한 과정을 거쳤다.
+
+```{r}
+# baseline model
+set.seed(1023)
+grid_default <- list(booster="gbtree", objective="multi:softmax", num_class=5,
+                     eta=0.3, gamma=0, max_depth=6, min_child_weight=1, 
+                     subsample=1, colsample_bytree=1, eval_metric='merror')
+xgb_base <- xgb.cv(params=grid_default, data=tr_dat_xgb,
+                   nrounds=1000, nfold=5, showsd=T, print_every_n = 50,
+                   stratified=T, early_stopping_rounds=20, maximize=F)
+```
+
+그 결과, 154th iteration에서 가장 작은 error값을 가지는 것을 확인.
+이 값을 모델 training 과정에 반영시키자.
+
+```{r}
+# model training
+set.seed(1023)
+xgb_base1 <- xgb.train(params = grid_default, data=tr_dat_xgb,
+                       nrounds = 154, maximize=F)
+# model prediction
+xgb_preds <- predict(xgb_base1, ts_dat_xgb)
+```
+
+fitting된 model로 test set에서의 성능을 확인해보면 다음과 같다.
+
+```{r}
+confusionMatrix(as.factor(xgb_preds), as.factor(ts_label))
+```
+
+
+
+```{r}
+# variance importance plot
+ipt_mat <- xgb.importance(feature_names = colnames(new_train_xgb),
+                          model = xgb_base1)
+ipt_mat[1:10]
+```
+
+```{r}
+# importance plot
+xgb.plot.importance(importance_matrix = ipt_mat[1:10])
+```
+
+성능을 좀 더 향상시켜보자.
+이를 위해서 mlr 패키지를 사용해야 하는데, 이 패키지의 함수들은 character를 안 받음. 그래서 character feature들을 factor로 변환해주어야.
+
+```{r multi_xgb_tune}
+#convert characters to factors
+fact_col <- colnames(train_xgb)[sapply(train_xgb, is.character)]
+for(i in fact_col) set(train_xgb, j=i, value = factor(train_xgb[[i]]))
+for(i in fact_col) set(test_xgb, j=i, value = factor(test_xgb[[i]]))
+
+train_xgb <- as.data.frame(train_xgb) %>%
+  dummy_cols(remove_selected_columns=TRUE)
+colnames(train_xgb)[20] <- "VAX_DOSE_SERIES_UP7"
+train_xgb['target'] <- vector("character", length=nrow(train_xgb))
+train_xgb[train_xgb$ADVERSE_OTHER == 1, "target"] <- "ADVERSE_OTHER"
+train_xgb[train_xgb$ADVERSE_PAIN == 1, "target"] <- "ADVERSE_PAIN"
+train_xgb[train_xgb$ADVERSE_HOSPITAL == 1, "target"] <- "ADVERSE_HOSPITAL"
+train_xgb[train_xgb$ADVERSE_DISORDER == 1, "target"] <- "ADVERSE_DISORDER"
+train_xgb[train_xgb$ADVERSE_DIED == 1, "target"] <- "ADVERSE_DIED"
+
+test_xgb <- as.data.frame(test_xgb) %>%
+  dummy_cols(remove_selected_columns=TRUE)
+colnames(test_xgb)[20] <- "VAX_DOSE_SERIES_UP7"
+test_xgb['target'] <- vector("character", length=nrow(test_xgb))
+test_xgb[test_xgb$ADVERSE_OTHER == 1, "target"] <- "ADVERSE_OTHER"
+test_xgb[test_xgb$ADVERSE_PAIN == 1, "target"] <- "ADVERSE_PAIN"
+test_xgb[test_xgb$ADVERSE_HOSPITAL == 1, "target"] <- "ADVERSE_HOSPITAL"
+test_xgb[test_xgb$ADVERSE_DISORDER == 1, "target"] <- "ADVERSE_DISORDER"
+test_xgb[test_xgb$ADVERSE_DIED == 1, "target"] <- "ADVERSE_DIED"
+
+# create tasks
+traintask <- makeClassifTask(data = train_xgb, target = "target")
+testtask <- makeClassifTask(data = test_xgb, target = "target")
+```
+
+```{r}
+# create learner
+lrn <- makeLearner("classif.xgboost", predict.type = "response")
+lrn$par.vals <- list(booster = "gbtree", objective="multi:softmax",
+                     num_class = 5, eval_metric="merror",nrounds=500L, eta=0.1)
+
+# set parameter space
+params <- makeParamSet(makeIntegerParam("max_depth", lower = 3L, upper = 10L),
+                       makeNumericParam("min_child_weight", lower = 1L, upper = 10L),
+                       makeNumericParam("subsample", lower = 0.5, upper = 1),
+                       makeNumericParam("colsample_bytree", lower = 0.5, upper = 1))
+
+# set resampling strategy : 5-fold CV
+rdesc <- makeResampleDesc("CV", stratify = T, iters=5L)
+
+# search strategy
+ctrl <- makeTuneControlRandom(maxit = 10L)
+```
+
+```{r}
+# set parallel backend
+library(parallel)
+library(parallelMap) 
+parallelStartSocket(cpus = detectCores())
+
+# parameter tuning
+set.seed(1023)
+mytune <- tuneParams(learner = lrn, task = train_task,
+                     resampling = rdesc, measures = acc,
+                     par.set = params, control = ctrl, show.info = T)
+
+#set hyper-parameters
+lrn_tune <- setHyperPars(lrn, par.vals = mytune$x)
+```
+
+```{r}
+# model training
+xgb_tune <- mlr::train(learner = lrn_tune, task = train_task)
+
+# predict model
+xgb_preds <- predict(xgb_tune, test_task)
+```
+
+```{r}
+# confusion matrix
+confusionMatrix(xgb_preds$data$response, xgb_preds$data$truth)
+```
+
+
+
+
+# ADVERSE class 이분류 -----
+
+앞서 svm에서 했던 것과 마찬가지로 ADVERSED의 class를 OTHER+PAIN/HOSPITAL+DISORDER+DIED 이렇게 binary class로 새롭게 정립하고서, 위의 과정을 똑같이 시행.
+
+```{r class_multi_to_bin}
+# response to binary class
+df_xgb$ADVERSE <- df_xgb$ADVERSE %>% as.character()
+
+df_xgb[df_xgb$ADVERSE %in% c("OTHER", "PAIN"), "ADVERSE"] <- 0
+df_xgb[df_xgb$ADVERSE %in% c("HOSPITAL", "DISORDER", "DIED"), "ADVERSE"] <- 1
+df_xgb$ADVERSE <- df_xgb$ADVERSE %>% as.integer()
+
+# adverse 변수가 제일 마지막에 위치하도록 변경한 것.
+df_xgb <- df_xgb %>% select(1:16, 18:20, 17)
+```
+
+
+```{r split_data}
+# split the data into training and test set
+set.seed(3)
+testIdx <- createDataPartition(df_xgb$ADVERSE, p=0.2, list=FALSE)
+
+train_xgb <- df_xgb[-testIdx, ]
+test_xgb <- df_xgb[testIdx, ]
+
+# convert data frame to data table
+setDT(train_xgb)
+setDT(test_xgb)
+```
+
+```{r data_for_bin}
+tr_label <- train_xgb$ADVERSE
+ts_label <- test_xgb$ADVERSE
+
+new_train_xgb <- model.matrix(~.+0, data=train_xgb[,-c("ADVERSE"), with=FALSE])
+new_test_xgb <- model.matrix(~.+0, data=test_xgb[,-c("ADVERSE"), with=FALSE])
+
+# new_train_xgb랑 new_test_xgb랑 column 맞춰주는 작업
+# new_test_xgb에 없는 column 찾아내기
+train_cols <- colnames(new_train_xgb)
+not_in_test <- train_cols[!(train_cols %in% colnames(new_test_xgb))]
+# 그렇게 찾아낸 column 영벡터로 채워넣기
+new_test_xgb <- cbind(new_test_xgb,
+                      `VAX_ROUTEIN` = rep(0, dim(new_test_xgb)[1]),
+                      `VAX_ROUTEPO` = rep(0, dim(new_test_xgb)[1]),
+                      `VAX_SITEMO` = rep(0, dim(new_test_xgb)[1]),
+                      `VAX_SITENS` = rep(0, dim(new_test_xgb)[1]))
+# new_train_xgb와 column order도 맞춰야 함
+new_test_xgb <- new_test_xgb %>% as.data.frame() %>%
+  select(1:8, 43, 9:10, 44, 11:16, 45:46, 17:42) %>%
+  as.matrix()
+
+# xgb.train에 쓰일 수 있는 적절한 형태의 input type으로 만들어주자.
+tr_dat_xgb <- xgb.DMatrix(data=new_train_xgb, label=tr_label)
+ts_dat_xgb <- xgb.DMatrix(data=new_test_xgb, label=ts_label)
+```
+
+nrounds 값은 CV를 통해 tuning 되어야 함.
+따라서 default 모델을 적합하기에 앞서 nrounds를 결정지어주자.
+
+```{r xgb_bin_classifier}
+# baseline model
+set.seed(1023)
+grid_default <- list(booster="gbtree", objective="binary:logistic",
+                     eval_metric="error", eta=0.3, gamma=0, max_depth=6,
+                     min_child_weight=1, subsample=1, colsample_bytree=1)
+xgb_base <- xgb.cv(params=grid_default, data=tr_dat_xgb,
+                   nrounds=1000, nfold=5, showsd=T, print_every_n = 50,
+                   stratified=T, early_stopping_rounds=20, maximize=F)
+```
+
+
+```{r model_train}
+# model training
+set.seed(1023)
+xgb_base1 <- xgb.train(params = grid_default, data=tr_dat_xgb,
+                       nrounds = 285, maximize=F)
+# model prediction
+xgb_preds <- predict(xgb_base1, ts_dat_xgb)
+xgb_preds <- ifelse(xgb_preds > 0.5, 1, 0)
+```
+
+
+```{r xgb_bin_confusionMatrix}
+# confusion matrix for test set
+confusionMatrix(as.factor(xgb_preds), as.factor(ts_label))
+```
+
+
+```{r xgb_bin_iptMat}
+# variable importance plot
+bin_ipt_mat <- xgb.importance(feature_names = colnames(tr_dat_xgb),
+                              model = xgb_base1)
+bin_ipt_mat[1:10]
+xgb.plot.importance(importance_matrix = bin_ipt_mat[1:10]) 
+```
+
+또 위에서와 마찬가지로 tuning 과정을 거쳐주자.
+
+```{r dat_for_binTune}
+#convert characters to factors
+fact_col <- colnames(train_xgb)[sapply(train_xgb, is.character)]
+
+for(i in fact_col) set(train_xgb, j=i, value = factor(train_xgb[[i]]))
+for (i in fact_col) set(test_xgb, j=i, value = factor(test_xgb[[i]]))
+
+# one-hot encoding
+train_xgb <- as.data.frame(train_xgb) %>%
+  dummy_cols(select_columns = c("VAX_DOSE_SERIES", "VAX_ROUTE", "VAX_SITE",
+                                "VAX_NAME", "SEX", "V_ADMINBY"),
+             remove_selected_columns = TRUE)
+colnames(train_xgb)[21] <- "VAX_DOSE_SERIES_UP7"
+test_xgb <- as.data.frame(test_xgb) %>%
+  dummy_cols(select_columns = c("VAX_DOSE_SERIES", "VAX_ROUTE", "VAX_SITE",
+                                "VAX_NAME", "SEX", "V_ADMINBY"),
+             remove_selected_columns = TRUE)
+colnames(test_xgb)[21] <- "VAX_DOSE_SERIES_UP7"
+
+test_xgb <- cbind(test_xgb,
+                  `VAX_ROUTE_IN` = rep(0, dim(test_xgb)[1]),
+                  `VAX_ROUTE_PO` = rep(0, dim(test_xgb)[1]),
+                  `VAX_SITE_MO` = rep(0, dim(test_xgb)[1]),
+                  `VAX_SITE_NS` = rep(0, dim(test_xgb)[1]))
+# new_train_xgb와 column order도 맞춰야 함
+test_xgb <- test_xgb %>% 
+  select(1:23, 49, 24:25, 50, 26:32, 51:52, 33:48)
+
+# create tasks
+train_task <- makeClassifTask(data = train_xgb, target = "ADVERSE")
+test_task <- makeClassifTask(data = test_xgb, target = "ADVERSE")
+```
+
+```{r tuning}
+# create learner
+lrn <- makeLearner("classif.xgboost", predict.type = "response")
+lrn$par.vals <- list(booster = "gbtree", objective="binary:logistic",
+                     eval_metric="error",nrounds=500L, eta=0.1)
+
+# set parameter space
+params <- makeParamSet(makeIntegerParam("max_depth", lower = 3L, upper = 10L),
+                       makeNumericParam("min_child_weight", lower = 1L, upper = 10L),
+                       makeNumericParam("subsample", lower = 0.5, upper = 1),
+                       makeNumericParam("colsample_bytree", lower = 0.5, upper = 1))
+
+# set resampling strategy : 5-fold CV
+rdesc <- makeResampleDesc("CV", stratify = T, iters=5L)
+
+# search strategy
+ctrl <- makeTuneControlRandom(maxit = 10L)
+```
+
+```{r}
+# set parallel backend
+library(parallel)
+library(parallelMap) 
+parallelStartSocket(cpus = detectCores())
+
+# parameter tuning
+mytune <- tuneParams(learner = lrn, task = train_task,
+                     resampling = rdesc, measures = acc,
+                     par.set = params, control = ctrl, show.info = T)
+
+#set hyper-parameters
+lrn_tune <- setHyperPars(lrn, par.vals = mytune$x)
+```
+
+```{r}
+# model training
+xgb_tune <- mlr::train(learner = lrn_tune, task = train_task)
+
+# predict model
+xgb_preds <- predict(xgb_tune, test_task)
+```
+
+```{r}
+# confusion matrix
+confusionMatrix(xgb_preds$data$response, xgb_preds$data$truth)
+```
+
+성능에 엄청난 개선이 있는 것은 아니지만, 그래도 전반적으로 수치들이 개선된 것을 확인해볼 수 있다. 여기서는 eta와 gamma에 대한 tuning은 진행하지 않았는데, 이들에 대한 tuning도 진행된다면 더 좋은 성능을 보일 것으로 예상된다.
+
+
+
+## multiple logistic ---------------------------------
+
+마지막으로 logistic에서의 성능과 비교해보자.
+
+(1) 우선 SVM과 비교
+
+```{r}
+train_logit_svm <- train_svm %>%
+  select(HOSPDAYS, DISABLE, AGE_YRS, SEX, CVD,
+         Lifestyle, L_THREAT, ER_ED_VISIT, ADVERSE)
+test_logit_svm <- test_svm %>%
+  select(HOSPDAYS, DISABLE, AGE_YRS, SEX, CVD,
+         Lifestyle, L_THREAT, ER_ED_VISIT, ADVERSE)
+
+# model training
+m_logit <- glm(ADVERSE ~ .-1, data=train_logit_svm, family="binomial")
+
+summary(m_logit)
+```
+
+
+```{r}
+# prediction
+logit_svm_preds <- predict(m_logit, newdata=test_logit_svm)
+logit_svm_preds <- ifelse(logit_svm_preds > 0.5, 1, 0)
+
+confusionMatrix(as.factor(logit_svm_preds), as.factor(test_logit_svm$ADVERSE))
+```
+
+(2) 다음은 xgb랑 비교
+
+```{r}
+# model training
+m_logit_xgb <- glm(ADVERSE ~ .-1, data=train_xgb, family="binomial")
+summary(m_logit_xgb)
+```
+
+```{r}
+# prediction
+logit_xgb_preds <- predict(m_logit_xgb, newdata = test_xgb)
+logit_xgb_preds <- ifelse(logit_xgb_preds > 0.5, 1, 0)
+
+confusionMatrix(as.factor(logit_xgb_preds), as.factor(test_xgb$ADVERSE))
+```
+
+
